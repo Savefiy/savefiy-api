@@ -127,7 +127,9 @@ def download_opts(token: str, quality: str) -> dict:
     else:
         h = int(quality) if quality.isdigit() else 720
         if FFMPEG_DIR:
-            opts["format"] = f"bv*[height<=?{h}]+ba/b[height<=?{h}]/b"
+            # Last options cover videos that have no audio track (common on Pinterest).
+            opts["format"] = (f"bv*[height<=?{h}]+ba/b[height<=?{h}]/"
+                              f"bv*[height<=?{h}]/b/bv*")
             opts["merge_output_format"] = "mp4"
         else:
             opts["format"] = f"b[height<=?{h}][protocol^=http]/b[height<=?{h}]/b"
@@ -169,7 +171,10 @@ def download(req: DownloadRequest):
             ydl.download([req.url])
     except Exception as e:
         log.exception("yt-dlp download failed for %s", req.url)
-        raise HTTPException(status_code=422, detail=str(e)[:300])
+        msg = str(e)
+        if req.quality == "audio" and "Requested format is not available" in msg:
+            msg = "This video has no audio track."
+        raise HTTPException(status_code=422, detail=msg[:300])
     finally:
         SLOTS.release()
 
