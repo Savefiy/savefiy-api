@@ -1,12 +1,8 @@
 """
 Savefiy backend (minimal).
 
-Setup:
-    pip install fastapi uvicorn yt-dlp
-Run locally:
-    uvicorn app:app --host 0.0.0.0 --port 8000
-Then in savefiy.html set:
-    const CONFIG = { API_URL: "https://YOUR-SERVER/download", ... }
+Setup:    pip install fastapi uvicorn yt-dlp
+Run:      uvicorn app:app --host 0.0.0.0 --port 8000
 
 Step 1 (preview):  POST /download { "url": "...", "mode": "info" }
                    -> { "title": "...", "thumbnail": "...", "duration": 123 }
@@ -21,24 +17,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Change this to the domain where savefiy.html is hosted ("*" only while testing).
+# Change this to the domain where the website is hosted ("*" only while testing).
 ALLOWED_ORIGINS = ["*"]
 
-# Only these sites are accepted (also protects the server from being used on random URLs).
 ALLOWED_DOMAINS = (
     "instagram.com", "instagr.am", "facebook.com", "fb.watch", "fb.com",
     "youtube.com", "youtu.be", "pinterest.com", "pin.it", "tiktok.com",
 )
-
-# Single-file formats, so no ffmpeg is needed. "audio" returns M4A (true MP3 needs ffmpeg).
-FORMATS = {
-    "360": "best[height<=?360][ext=mp4]/best[height<=?360]/best",
-    "720": "best[height<=?720][ext=mp4]/best[height<=?720]/best",
-    # Note: on YouTube, real 1080p is split into separate video+audio streams and needs ffmpeg
-    # to merge. Without ffmpeg this falls back to the best single-file stream (often 720p).
-    "1080": "best[height<=?1080][ext=mp4]/best[height<=?1080]/best",
-    "audio": "bestaudio[ext=m4a]/bestaudio",
-}
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("savefiy")
@@ -63,17 +48,54 @@ def is_allowed(url: str) -> bool:
     return any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS)
 
 
+def direct_formats(info):
+    """Formats a browser can download directly (plain http/https, not HLS/DASH streams)."""
+    return [
+        f for f in (info.get("formats") or [])
+        if f.get("url") and f.get("protocol") in ("http", "https")
+    ]
+
+
+def pick_file(info, quality):
+    """Choose one direct file URL for the requested quality (no ffmpeg needed)."""
+    fmts = direct_formats(info)
+
+    if quality == "audio":
+        audio = [f for f in fmts if f.get("vcodec") == "none"]
+        audio.sort(key=lambda f: f.get("abr") or 0, reverse=True)
+        if audio:
+            return audio[0]
+
+    # Files that already contain both video and audio.
+    both = [f for f in fmts if f.get("vcodec") != "none" and f.get("acodec") != "none"]
+    if both:
+        try:
+            limit = int(quality)
+        except ValueError:
+            limit = 720
+        height = lambda f: f.get("height") or 0
+        within = [f for f in both if height(f) <= limit]
+        if within:  # best quality that is not above the requested one
+            return max(within, key=lambda f: (height(f), f.get("ext") == "mp4"))
+        return min(both, key=height)  # everything is higher: take the lowest
+
+    # Last resort: a single direct URL that yt-dlp already selected.
+    if info.get("url") and info.get("protocol") in ("http", "https"):
+        return info
+    return None
+
+
 @app.post("/download")
 def download(req: DownloadRequest):
     if not is_allowed(req.url):
         raise HTTPException(status_code=400, detail="unsupported platform")
 
-    opts = {"quiet": True, "noplaylist": True, "skip_download": True}
-    if req.mode == "info":
-        # Preview only needs title/thumbnail, so don't fail on format selection.
-        opts["ignore_no_formats_error"] = True
-    else:
-        opts["format"] = FORMATS.get(req.quality, FORMATS["720"])
+    opts = {
+        "quiet": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "ignore_no_formats_error": True,
+    }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(req.url, download=False)
@@ -82,12 +104,20 @@ def download(req: DownloadRequest):
         raise HTTPException(status_code=422, detail=str(e)[:300])
 
     if req.mode == "info":
-        return {"title": info.get("title"), "thumbnail": info.get("thumbnail"), "duration": info.get("duration")}
+        return {
+            "title": info.get("title"),
+            "thumbnail": info.get("thumbnail"),
+            "duration": info.get("duration"),
+        }
 
-    direct_url = info.get("url")
-    if not direct_url:
-        raise HTTPException(status_code=422, detail="no downloadable format")
-    return {"download_url": direct_url, "title": info.get("title")}
+    chosen = pick_file(info, req.quality)
+    if not chosen:
+        log.warning("no direct file for %s", req.url)
+        raise HTTPException(
+            status_code=422,
+            detail="No direct file link for this video (it is a streaming-only video).",
+        )
+    return {"download_url": chosen["url"], "title": info.get("title")}
 
 
 @app.get("/health")
